@@ -1,0 +1,6 @@
+{
+  "BOT_TOKEN": "วาง Bot Token จากขั้นที่ 1 ตรงนี้",
+  "ALLOWED_USER_ID": "Discord user ID ของคุณ (คลิกขวาชื่อตัวเอง > Copy User ID)",
+  "GUILD_ID": "Server ID จากขั้นที่ 1 (เว้นว่างได้ แต่คำสั่งจะขึ้นช้า)",
+  "WEBHOOK_URL": "วาง URL เว็บฮุคจากขั้นที่ 2 ตรงนี้"
+}
