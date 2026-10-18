@@ -32,24 +32,35 @@ python grade_watch_v3.py --discover        # dump site select/button/link names 
 Scaling measurements, run against a local synthetic server (no live site needed). Use these to re-validate load assumptions before changing the crawling architecture. Requires `.venv` with `playwright`, `pillow`, `psutil`.
 
 ```bash
-.venv/bin/python bench/fanout_bench.py            # concurrent-context cost + RAM
-.venv/bin/python bench/session_reuse_test.py      # storage_state session reuse
+.venv/bin/python bench/fanout_bench.py                       # concurrent-context cost + RAM
+DOGRADE_SID=<id> DOGRADE_PW=<dd/mm/yyyy> \
+  .venv/bin/python bench/live_session_test.py                # real-site session behaviour
 ```
 
-Measured on a 16 GB / 10-core Mac, local server (2026-10-18) — **one Chromium + 28 contexts, not 28 Chromiums**:
+### Session reuse does NOT work on the real site — measured, not assumed
 
-| Scenario (28 students) | Wall | RAM |
-|---|---|---|
-| Fast check (1 screenshot each) | 1.1 s | ~240 MB |
-| Full sweep (7 screenshots each) | 4.3 s | ~240 MB |
-| Contexts held open (persistent sessions) | 0.6 s | **3250 MB** |
+`storage_state` round-trip **fails** at `dograde.online`. Tested against the live site: login succeeds and yields exactly one cookie (`SSUser`, persistent) and zero localStorage. Restoring that state into a fresh context *does* re-apply the cookie, but the site still bounces to the login page on both `/prakan/` and `/prakan/DooTermX.aspx`. The session is bound to server-side state, not the cookie. **A synthetic local server passes this test and is a false positive** — only `live_session_test.py` is authoritative.
 
-Two facts that drive architecture decisions:
+What *does* work: the session survives as long as the browser context stays open, including a detour through `about:blank` and back. So the workable shape is **hold contexts open and park them on `about:blank` between checks**, rather than serializing sessions.
 
-- **One browser with N contexts is ~240 MB, not ~5 GB.** Holding contexts open costs ~115 MB each — a 13× penalty. Prefer transient contexts.
-- `context.storage_state()` + `restore in a new context` re-authenticates without a login round-trip (0.03 s vs 0.14 s). This is how to skip re-login without paying the held-context memory cost. **Validated against a synthetic ASP.NET-style cookie only** — re-confirm against the live site, since a real session cookie may expire server-side or ride on ViewState that does not serialize.
+### Measured costs (16 GB / 10-core Mac, 28 students)
 
-These numbers are client-side with zero network latency. Real wall time will be dominated by the school server, not by Chromium — so the client has large headroom and the risk lives entirely in site load and login rate.
+| Scenario | RAM |
+|---|---|
+| Transient contexts (create/close per check) | ~170–240 MB |
+| Held open, pages loaded | ~2050 MB |
+| Held open, parked on `about:blank` | ~1310 MB |
+
+One browser with 28 contexts is ~240 MB, not the ~5 GB that 28 separate Chromium processes would cost. Parking reclaims roughly a third of the held-context cost, because a live rendered page is the expensive part.
+
+**Real-site login takes ~5.3–6 s.** That is the dominant per-student cost, and the reason session reuse mattered enough to test.
+
+Wall times are unreliable and load-dependent: the same 28-student full sweep measured 4.3 s on an idle machine and 21.8 s under load. Do not quote a single number as a capacity plan.
+
+### Still unknown
+
+- How long a held session stays valid server-side before the site forces re-login (must be detected and handled — see the login-success check in `login()`).
+- Whether the school tolerates ~28 simultaneous sessions from one IP. Untested; stage the rollout.
 
 ## How "grade released" is actually detected
 

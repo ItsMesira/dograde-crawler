@@ -78,8 +78,9 @@ async def run_batch(browser, url, n, shots):
     return wall, times
 
 
-async def measure_held(browser, url, n):
+async def measure_held(browser, url, n, park=False):
     """เปิด N context ค้างไว้พร้อมกัน (จำลอง persistent session ที่ไม่ต้องล็อกอินใหม่)
+    park=True -> พักหน้าไว้ที่ about:blank หลังโหลด (คง session แต่ปล่อย RAM ของหน้า)
     คืน (RAM ที่ค้างอยู่, เวลาที่แคปพร้อมกันจาก context ที่ค้าง)"""
     ctxs = []
     try:
@@ -90,6 +91,10 @@ async def measure_held(browser, url, n):
             await page.wait_for_timeout(100)
             ctxs.append(ctx)
         await asyncio.sleep(0.5)
+        if park:
+            for ctx in ctxs:
+                await ctx.pages[0].goto("about:blank")
+            await asyncio.sleep(0.5)
         rss = browser_rss()
         t0 = time.perf_counter()
         await asyncio.gather(*(c.pages[0].screenshot(full_page=True) for c in ctxs))
@@ -143,6 +148,14 @@ async def main():
         print(f"{'คน':>5} {'แคปพร้อมกัน(s)':>15} {'RAM ค้าง(MB)':>14}")
         for n in args.students:
             rss, wall = await measure_held(browser, url, n)
+            print(f"{n:>5} {wall:>15.2f} {rss:>14.0f}")
+        print()
+
+        # พักหน้าที่ about:blank: คง session ไว้ แต่ปล่อย RAM ของหน้าที่เรนเดอร์
+        print("===== โหมด held+parked (พักหน้า about:blank ระหว่างรอบ) =====")
+        print(f"{'คน':>5} {'แคปพร้อมกัน(s)':>15} {'RAM ค้าง(MB)':>14}")
+        for n in args.students:
+            rss, wall = await measure_held(browser, url, n, park=True)
             print(f"{n:>5} {wall:>15.2f} {rss:>14.0f}")
         print()
 
