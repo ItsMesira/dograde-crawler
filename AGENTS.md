@@ -27,6 +27,30 @@ python grade_watch_v3.py --discover        # dump site select/button/link names 
 - **Always run from the repo root.** `bot_config.json` resolves via `Path(__file__)`, but `BASE_DIR = Path("shots")` (grade_watch_v3.py:71) is **CWD-relative**. Running from elsewhere finds the config but writes `shots/` to a different tree. `run_bot.bat` guards this with `cd /d %~dp0`; manual `python` runs don't.
 - Verification is manual only: `--test` proves the webhook, `--debug` proves one cycle. Both need real credentials and the live site. There is nothing to run offline.
 
+## Benchmarks (`bench/`)
+
+Scaling measurements, run against a local synthetic server (no live site needed). Use these to re-validate load assumptions before changing the crawling architecture. Requires `.venv` with `playwright`, `pillow`, `psutil`.
+
+```bash
+.venv/bin/python bench/fanout_bench.py            # concurrent-context cost + RAM
+.venv/bin/python bench/session_reuse_test.py      # storage_state session reuse
+```
+
+Measured on a 16 GB / 10-core Mac, local server (2026-10-18) — **one Chromium + 28 contexts, not 28 Chromiums**:
+
+| Scenario (28 students) | Wall | RAM |
+|---|---|---|
+| Fast check (1 screenshot each) | 1.1 s | ~240 MB |
+| Full sweep (7 screenshots each) | 4.3 s | ~240 MB |
+| Contexts held open (persistent sessions) | 0.6 s | **3250 MB** |
+
+Two facts that drive architecture decisions:
+
+- **One browser with N contexts is ~240 MB, not ~5 GB.** Holding contexts open costs ~115 MB each — a 13× penalty. Prefer transient contexts.
+- `context.storage_state()` + `restore in a new context` re-authenticates without a login round-trip (0.03 s vs 0.14 s). This is how to skip re-login without paying the held-context memory cost. **Validated against a synthetic ASP.NET-style cookie only** — re-confirm against the live site, since a real session cookie may expire server-side or ride on ViewState that does not serialize.
+
+These numbers are client-side with zero network latency. Real wall time will be dominated by the school server, not by Chromium — so the client has large headroom and the risk lives entirely in site load and login rate.
+
 ## How "grade released" is actually detected
 
 **It is a pixel diff of a full-page screenshot, not a DOM check.** Do not "fix" `read_grades`/`read_page`/`text_changes` expecting them to drive alerts:
