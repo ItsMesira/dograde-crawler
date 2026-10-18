@@ -13,7 +13,7 @@
     python grade_watch_v3.py --test      # ทดสอบแท็ก Discord
     python grade_watch_v3.py --discover  # ล็อกอินแล้วสรุปปุ่ม/dropdown ของเว็บส่ง Discord (ไว้ปรับการเลือกปี/ภาค)
 """
-import collections, json, mimetypes, os, random, re, shutil, statistics, sys, time, datetime
+import asyncio, collections, json, mimetypes, os, random, re, shutil, statistics, sys, time, datetime
 from pathlib import Path
 
 try:  # กัน cmd ภาษาไทยพังตอนพิมพ์อีโมจิ
@@ -22,7 +22,7 @@ except Exception:
     pass
 
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 try:  # ไม่บังคับ: ถ้าติดตั้ง psutil (pip install psutil) จะแสดง CPU/RAM/เน็ตของเครื่องเราด้วย
     import psutil
@@ -149,23 +149,23 @@ def special_folder(sid, name):
     return p
 
 
-def snap(page, folder, label):
+async def snap(page, folder, label):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = Path(folder) / f"{label}_{ts}.png"
-    page.screenshot(path=str(path), full_page=True)
+    await page.screenshot(path=str(path), full_page=True)
     return path
 
 
 # ---------- ช่วยจัดการหน้าเว็บ ----------
-def settle(page):
+async def settle(page):
     try:
-        page.wait_for_load_state("networkidle", timeout=10000)
+        await page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
         pass
-    page.wait_for_timeout(800)
+    await page.wait_for_timeout(800)
 
 
-def click_by_text(page, pattern):
+async def click_by_text(page, pattern):
     """หาและคลิกตามข้อความ ค้นหาในทุก frame (รวม iframe)"""
     rx = re.compile(pattern)
     for fr in page.frames:
@@ -175,8 +175,8 @@ def click_by_text(page, pattern):
         for g in getters:
             try:
                 loc = g()
-                if loc.count() > 0 and loc.first.is_visible():
-                    loc.first.click(timeout=5000)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=5000)
                     return True
             except Exception:
                 continue
@@ -201,21 +201,21 @@ _JS_CLICK = """
 """
 
 
-def js_click(page, needle):
+async def js_click(page, needle):
     """สำรอง: คลิกด้วย JavaScript ในทุก frame โดยเทียบข้อความที่ตัดช่องว่าง/อักขระล่องหนออกแล้ว"""
     for fr in page.frames:
         try:
-            if fr.evaluate(_JS_CLICK, needle):
+            if await fr.evaluate(_JS_CLICK, needle):
                 return True
         except Exception:
             continue
     return False
 
 
-def click_label(page, pattern, needle):
-    if click_by_text(page, pattern):
+async def click_label(page, pattern, needle):
+    if await click_by_text(page, pattern):
         return True
-    return js_click(page, needle)
+    return await js_click(page, needle)
 
 
 _JS_DUMP = """
@@ -230,11 +230,11 @@ _JS_DUMP = """
 """
 
 
-def dump_clickables(page):
+async def dump_clickables(page):
     parts = []
     for i, fr in enumerate(page.frames):
         try:
-            items = fr.evaluate(_JS_DUMP)
+            items = await fr.evaluate(_JS_DUMP)
         except Exception:
             items = []
         parts.append(f"frame{i} ({(fr.url or '')[:60]}): " + ", ".join(items))
@@ -248,21 +248,21 @@ def term_patterns(y, t):
             rf"(^|\D){y}\s*/\s*{t}(\D|$)"]
 
 
-def pick_select(page, y, t):
+async def pick_select(page, y, t):
     """เลือกปี/ภาคจาก dropdown (<select>) คืนข้อความอธิบายวิธี หรือ None"""
     combo = re.compile(rf"ปี\D{{0,8}}{y}\D{{0,12}}ภาค\D{{0,8}}{t}|(^|\D){y}\s*/\s*{t}(\D|$)")
     yr_rx = re.compile(rf"(ปี|ชั้น|ม\.?)\D{{0,8}}{y}(\D|$)")
     tm_rx = re.compile(rf"(ภาค|เทอม|term)\D{{0,8}}{t}(\D|$)", re.I)
     used = []
     try:
-        n = page.locator("select:visible").count()
+        n = await page.locator("select:visible").count()
     except Exception:
         return None
     for i in range(n):  # query ใหม่ทุกครั้ง เพราะ postback อาจสร้าง DOM ใหม่
         try:
             sel = page.locator("select:visible").nth(i)
-            opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
-            meta = ((sel.get_attribute("id") or "") + " " + (sel.get_attribute("name") or "")).lower()
+            opts = [o.strip() for o in await sel.locator("option").all_inner_texts()]
+            meta = (((await sel.get_attribute("id")) or "") + " " + ((await sel.get_attribute("name")) or "")).lower()
             year_hint = re.search(r"year|yr|class|level|grade|ปี|ชั้น", meta)
             term_hint = re.search(r"term|sem|ภาค|เทอม", meta)
             hit = next((o for o in opts if combo.search(o)), None) \
@@ -271,14 +271,14 @@ def pick_select(page, y, t):
                 or (next((o for o in opts if o == str(y)), None) if year_hint else None) \
                 or (next((o for o in opts if o == str(t)), None) if term_hint else None)
             if hit:
-                sel.select_option(label=hit)
+                await sel.select_option(label=hit)
                 used.append(hit)
-                settle(page)
+                await settle(page)
         except Exception:
             continue
     if used:
-        click_by_text(page, r"^\s*(แสดง|แสดงผล|ค้นหา|ดูผล|ตกลง)\s*$")
-        settle(page)
+        await click_by_text(page, r"^\s*(แสดง|แสดงผล|ค้นหา|ดูผล|ตกลง)\s*$")
+        await settle(page)
         return "dropdown: " + " + ".join(used)
     return None
 
@@ -287,37 +287,37 @@ _METHOD_LABEL = ["คลิกปุ่มตรงชื่อพอดี", "�
                  "คลิกปุ่ม (รูปแบบชื่อชั้น)", "คลิกปุ่ม (รูปแบบย่อ)"]
 
 
-def go_term(page, y, t):
+async def go_term(page, y, t):
     """ไปหน้าปี y ภาค t คืนข้อความวิธีที่ใช้ (อ่านง่าย ไม่โชว์ regex) หรือ None ถ้าไม่เจอตัวเลือก"""
-    m = pick_select(page, y, t)
+    m = await pick_select(page, y, t)
     if m:
         return m
     for i, pat in enumerate(term_patterns(y, t)):
-        if click_by_text(page, pat):
-            settle(page)
+        if await click_by_text(page, pat):
+            await settle(page)
             return _METHOD_LABEL[i] if i < len(_METHOD_LABEL) else "คลิกปุ่ม"
-    if js_click(page, f"ปี{y}ภาค{t}"):
-        settle(page)
+    if await js_click(page, f"ปี{y}ภาค{t}"):
+        await settle(page)
         return "คลิกปุ่ม (วิธีสำรอง)"
-    if click_by_text(page, rf"^\s*(ปี|ชั้น)\D{{0,6}}{y}\s*$"):
-        settle(page)
-        if click_by_text(page, rf"^\s*(ภาค|เทอม)\D{{0,6}}{t}\s*$"):
-            settle(page)
+    if await click_by_text(page, rf"^\s*(ปี|ชั้น)\D{{0,6}}{y}\s*$"):
+        await settle(page)
+        if await click_by_text(page, rf"^\s*(ภาค|เทอม)\D{{0,6}}{t}\s*$"):
+            await settle(page)
             return "คลิกปี แล้วคลิกภาค"
         return "คลิกปีได้ แต่ไม่พบภาค"
     return None
 
 
-def read_grades(page):
+async def read_grades(page):
     result = []
-    for table in page.locator("table").all():
+    for table in await page.locator("table").all():
         try:
-            headers = [h.strip() for h in table.locator("tr").first.locator("th, td").all_inner_texts()]
+            headers = [h.strip() for h in await table.locator("tr").first.locator("th, td").all_inner_texts()]
             idx = next((i for i, h in enumerate(headers) if GRADE_COLUMN in h), None)
             if idx is None:
                 continue
-            for row in table.locator("tr").all()[1:]:
-                cells = [c.strip() for c in row.locator("td").all_inner_texts()]
+            for row in (await table.locator("tr").all())[1:]:
+                cells = [c.strip() for c in await row.locator("td").all_inner_texts()]
                 if len(cells) > idx:
                     nm = cells[1] if len(cells) > 1 else cells[0]
                     result.append(f"{nm}: {cells[idx]}")
@@ -326,15 +326,15 @@ def read_grades(page):
     return result
 
 
-def read_page(page):
-    body = page.inner_text("body")
+async def read_page(page):
+    body = await page.inner_text("body")
     if "Server Error" in body or "Runtime Error" in body:
         raise Exception("เว็บล่ม: ขึ้นหน้า Server Error ระหว่างเปิดหน้าผลการเรียน")
     m = re.search(r"ปรับปรุง[^\d]*(\d{1,2}:\d{2}\s+\d{1,2}/\d{1,2}/\d{4})", body)
     updated = re.sub(r"\s+", " ", m.group(1)).strip() if m else None
     nm = NAME_RE.search(body)
     name = re.sub(r"\s+", " ", nm.group(1)).strip() if nm else None
-    return body, updated, read_grades(page), name
+    return body, updated, await read_grades(page), name
 
 
 def is_graded(g):
@@ -342,33 +342,42 @@ def is_graded(g):
 
 
 # ---------- ล็อกอิน ----------
-def login(page, S, dialogs):
+async def _on_dialog(d, dialogs):
+    """Playwright async: dialog.accept() เป็น coroutine ต้อง await จึงต้องเป็น handler แบบ async"""
+    try:
+        dialogs.append(d.message)
+        await d.accept()
+    except Exception:
+        pass
+
+
+async def login(page, S, dialogs):
     sid, pw = S["sid"], S["pw"]
     step("🌐 กำลังเปิดเว็บ")
-    resp = page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+    resp = await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
     if resp is not None and resp.status >= 400:
         raise Exception(f"เว็บตอบกลับ HTTP {resp.status}")
-    settle(page)
+    await settle(page)
 
-    top = page.inner_text("body")
+    top = await page.inner_text("body")
     if "Server Error" in top or "Runtime Error" in top:
         raise Exception("เว็บล่ม: ขึ้นหน้า Server Error ตั้งแต่เปิดเว็บ (เซิร์ฟเวอร์ของเว็บพัง ไม่ใช่ปัญหารหัส/สคริปต์)")
     fields = page.locator(
         'input:visible:not([type="hidden"]):not([type="submit"]):not([type="button"])'
         ':not([type="image"]):not([type="checkbox"]):not([type="radio"])')
-    n = fields.count()
+    n = await fields.count()
     if n < 2:
         raise Exception(f"หาช่องกรอกรหัส/วันเกิดไม่พบ (เจอ {n} ช่อง) เว็บอาจล่มหรือโหลดไม่เต็ม")
     step(f"⌨️ กรอกรหัสนักเรียน {sid} และวันเกิด")
-    fields.nth(0).fill(sid)
-    fields.nth(1).fill(pw)
+    await fields.nth(0).fill(sid)
+    await fields.nth(1).fill(pw)
 
     step("🔑 กดเข้าสู่ระบบ")
     sub = page.locator(SEL_SUBMIT)
     submitted = False
-    if sub.count() > 0:
+    if await sub.count() > 0:
         try:
-            sub.first.click(timeout=8000)
+            await sub.first.click(timeout=8000)
             submitted = True
         except Exception as e:
             # เว็บนี้เปลี่ยนหน้าทันทีตอนคลิก (ASP.NET postback) บางครั้ง Playwright
@@ -377,14 +386,14 @@ def login(page, S, dialogs):
             step(f"ℹ️ คลิกปุ่มมีข้อความเตือน ({str(e)[:70]}) กำลังตรวจว่าจริงๆ ผ่านไปหรือยัง")
     # ไม่ว่าจะคลิกสำเร็จ/error ให้รอหน้านิ่งแล้วดูว่าออกจากหน้า login ไปหรือยัง
     try:
-        page.wait_for_url(re.compile(r"DooTerm", re.I), timeout=10000)
+        await page.wait_for_url(re.compile(r"DooTerm", re.I), timeout=10000)
         submitted = True
     except Exception:
         pass
-    settle(page)
+    await settle(page)
     if not submitted:
         try:
-            flat_now = re.sub(r"\s+", "", page.inner_text("body"))
+            flat_now = re.sub(r"\s+", "", await page.inner_text("body"))
             if "ปรับปรุง" in flat_now or "ปี1ภาค1" in flat_now or "DooTerm" in page.url:
                 submitted = True
         except Exception:
@@ -392,16 +401,16 @@ def login(page, S, dialogs):
     if not submitted:
         # คลิกจริงๆ ไม่ติด ลองกด Enter แทน (จำกัดเวลาสั้นลง กันค้าง)
         try:
-            page.locator(
+            await page.locator(
                 'input:visible:not([type="hidden"]):not([type="submit"]):not([type="button"])'
                 ':not([type="image"]):not([type="checkbox"]):not([type="radio"])'
             ).nth(1).press("Enter", timeout=8000)
         except Exception as e2:
             step(f"⚠️ กด Enter แทนก็ไม่ได้ ({str(e2)[:70]})")
-        settle(page)
-    page.wait_for_timeout(500)
+        await settle(page)
+    await page.wait_for_timeout(500)
 
-    body = page.inner_text("body")
+    body = await page.inner_text("body")
     if "Server Error" in body or "Runtime Error" in body:
         raise Exception(f"ขึ้นหน้า Server Error หลังกดเข้าสู่ระบบ (URL ตอนนี้: {page.url})")
     flat = re.sub(r"\s+", "", body)
@@ -476,14 +485,14 @@ def image_check(S, key, folder, new_shot, tag):
     return False, changed, diff_pct
 
 
-def process_term(page, S, y, t, tag):
+async def process_term(page, S, y, t, tag):
     """แคปภาพ + เทียบกับภาพฐานของภาคนี้ คืน (changed:bool, grades)"""
-    body, updated, grades, name = read_page(page)
+    body, updated, grades, name = await read_page(page)
     if name and name != S["name"]:
         S["name"] = name
         step(f"👤 พบชื่อในเว็บ: **{name}**")
     folder = term_folder(S["sid"], y, t)
-    shot = snap(page, folder, f"Y{y}T{t}")
+    shot = await snap(page, folder, f"Y{y}T{t}")
     graded = sum(map(is_graded, grades))
     summary = (f"📸 **{tag}** | ปรับปรุง: {updated or 'ไม่พบ'} | "
                f"แถววิชา {len(grades)} | เกรดออกแล้ว {graded}/{len(grades)}")
@@ -508,22 +517,22 @@ def process_term(page, S, y, t, tag):
     return False, grades
 
 
-def do_pp1(page, ctx, S, downloads):
+async def do_pp1(page, ctx, S, downloads):
     step("📄 กำลังเปิดช่อง ปพ.1")
     folder = special_folder(S["sid"], "ปพ1")
     before = len(ctx.pages)
     downloads.clear()
-    if not click_label(page, r"ปพ\s*\.?\s*(1|๑)", "ปพ.1"):
-        shot = snap(page, folder, "PP1_notfound")
+    if not await click_label(page, r"ปพ\s*\.?\s*(1|๑)", "ปพ.1"):
+        shot = await snap(page, folder, "PP1_notfound")
         step("⚠️ ไม่พบปุ่ม/ลิงก์ ปพ.1 บนหน้านี้ (ส่งภาพหน้าปัจจุบันให้แทน) ลองรัน --discover เพื่อดูชื่อที่แท้จริง", shot)
         return False
-    page.wait_for_timeout(2500)
-    settle(page)
+    await page.wait_for_timeout(2500)
+    await settle(page)
     for d in list(downloads):
         try:
             ext = Path(d.suggested_filename).suffix or ".bin"
             fp = folder / f"PP1_{datetime.datetime.now():%Y%m%d_%H%M%S}{ext}"
-            d.save_as(str(fp))
+            await d.save_as(str(fp))
             step(f"📥 ดาวน์โหลดไฟล์ ปพ.1 ได้: {fp.name}", fp)
         except Exception as e:
             step(f"⚠️ บันทึกไฟล์ที่โหลดไม่ได้: {str(e)[:100]}")
@@ -531,10 +540,10 @@ def do_pp1(page, ctx, S, downloads):
     if len(ctx.pages) > before:
         target = ctx.pages[-1]
         try:
-            target.wait_for_load_state("domcontentloaded", timeout=10000)
+            await target.wait_for_load_state("domcontentloaded", timeout=10000)
         except Exception:
             pass
-    shot = snap(target, folder, "PP1")
+    shot = await snap(target, folder, "PP1")
     is_first, img_changed, diff_pct = image_check(S, "pp1", folder, shot, "ปพ.1")
     diff_txt = f" (ต่างจากภาพฐาน {diff_pct}%)" if diff_pct is not None else ""
     if is_first:
@@ -545,13 +554,13 @@ def do_pp1(page, ctx, S, downloads):
         step(f"📸 **ปพ.1**{diff_txt} ไม่มีการเปลี่ยนแปลง", shot)
     if target is not page:
         try:
-            target.close()
+            await target.close()
         except Exception:
             pass
     return img_changed
 
 
-def sweep(page, ctx, S, downloads):
+async def sweep(page, ctx, S, downloads):
     terms_list = S.get("watch_terms") or TERMS
     watch_pp1 = S.get("watch_pp1", True)
     names = " → ".join(f"ปี{y}ภาค{t}" for y, t in terms_list) + (" → ปพ.1" if watch_pp1 else "")
@@ -560,26 +569,26 @@ def sweep(page, ctx, S, downloads):
     prev = None
     for idx, (y, t) in enumerate(terms_list):
         tag = f"ปี {y} ภาค {t}"
-        method = go_term(page, y, t)
+        method = await go_term(page, y, t)
         if method is None and idx == 0:
             step(f"ℹ️ ไม่พบปุ่ม {tag} ใช้หน้าที่เว็บแสดงอยู่เป็น {tag}")
             if not S.get("diag_sent"):
                 S["diag_sent"] = True
                 step("🔎 รายการปุ่ม/ลิงก์ที่สคริปต์มองเห็นในหน้า (ส่งข้อความนี้ให้ผมดู):\n"
-                     + dump_clickables(page)[:1500])
-            changed, grades = process_term(page, S, y, t, tag)
+                     + (await dump_clickables(page))[:1500])
+            changed, grades = await process_term(page, S, y, t, tag)
             if not grades:
                 raise Exception(f"{tag} อ่านข้อมูลไม่ได้ (ยังไม่ไปต่อภาคอื่น) จะเริ่มรอบใหม่ตั้งแต่ {tag}")
             any_change = any_change or changed
             prev = grades or prev
             continue
         if method is None:
-            shot = snap(page, term_folder(S["sid"], y, t), f"Y{y}T{t}_notfound")
+            shot = await snap(page, term_folder(S["sid"], y, t), f"Y{y}T{t}_notfound")
             step(f"⚠️ ไม่พบตัวเลือกเลือก **{tag}** บนหน้าเว็บ (ส่งภาพหน้าปัจจุบันให้)", shot)
             if not S.get("diag_sent"):
                 S["diag_sent"] = True
                 step("🔎 รายการปุ่ม/ลิงก์ที่สคริปต์มองเห็นในหน้า (ส่งข้อความนี้ให้ผมดู):\n"
-                     + dump_clickables(page)[:1500])
+                     + (await dump_clickables(page))[:1500])
             continue
         step(f"🔀 เลือก **{tag}** แล้ว ({method})")
         changed, grades = process_term(page, S, y, t, tag)
@@ -591,7 +600,7 @@ def sweep(page, ctx, S, downloads):
         prev = grades or prev
     if watch_pp1:
         try:
-            if do_pp1(page, ctx, S, downloads):
+            if await do_pp1(page, ctx, S, downloads):
                 any_change = True
         except Exception as e:
             step(f"⚠️ ขั้นตอน ปพ.1 มีปัญหา: {str(e)[:150]}")
@@ -600,66 +609,66 @@ def sweep(page, ctx, S, downloads):
 
 
 # ---------- 1 รอบการเช็ค ----------
-def run_cycle(browser, S, force_sweep=False):
-    ctx = browser.new_context(viewport={"width": 1400, "height": 1000}, accept_downloads=True)
-    page = ctx.new_page()
+async def run_cycle(browser, S, force_sweep=False):
+    ctx = await browser.new_context(viewport={"width": 1400, "height": 1000}, accept_downloads=True)
+    page = await ctx.new_page()
     dialogs, downloads = [], []
-    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+    page.on("dialog", lambda d: asyncio.ensure_future(_on_dialog(d, dialogs)))
     page.on("download", lambda d: downloads.append(d))
     try:
         page.set_default_timeout(TIMEOUT_MS)
-        login(page, S, dialogs)
+        await login(page, S, dialogs)
 
-        changed = sweep(page, ctx, S, downloads)   # เช็คครบตามลำดับในทุกรอบ
+        changed = await sweep(page, ctx, S, downloads)   # เช็คครบตามลำดับในทุกรอบ
         S["swept_once"] = True
         save_state(S)
         return changed
     except Exception as e:
         # แคปหน้าตอน error แล้วส่งเข้า Discord ก่อนโยน error ต่อ
         try:
-            shot = snap(page, special_folder(S["sid"], "error"), "error")
+            shot = await snap(page, special_folder(S["sid"], "error"), "error")
             e.shot = shot
         except Exception:
             pass
         raise
     finally:
         try:
-            ctx.close()
+            await ctx.close()
         except Exception:
             pass
 
 
 # ---------- โหมดสำรวจโครงสร้างเว็บ ----------
-def discover(browser, S):
-    ctx = browser.new_context(viewport={"width": 1400, "height": 1000})
-    page = ctx.new_page()
+async def discover(browser, S):
+    ctx = await browser.new_context(viewport={"width": 1400, "height": 1000})
+    page = await ctx.new_page()
     dialogs = []
-    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+    page.on("dialog", lambda d: asyncio.ensure_future(_on_dialog(d, dialogs)))
     try:
         page.set_default_timeout(TIMEOUT_MS)
-        login(page, S, dialogs)
+        await login(page, S, dialogs)
         lines = []
-        for i in range(page.locator("select").count()):
+        for i in range(await page.locator("select").count()):
             s = page.locator("select").nth(i)
-            opts = [o.strip() for o in s.locator("option").all_inner_texts()][:40]
-            lines.append(f"[select] id={s.get_attribute('id')} name={s.get_attribute('name')} options={opts}")
+            opts = [o.strip() for o in await s.locator("option").all_inner_texts()][:40]
+            lines.append(f"[select] id={await s.get_attribute('id')} name={await s.get_attribute('name')} options={opts}")
         for sel in ("a", "button", 'input[type="submit"]', 'input[type="button"]'):
-            for i in range(min(page.locator(sel).count(), 80)):
+            for i in range(min(await page.locator(sel).count(), 80)):
                 el = page.locator(sel).nth(i)
-                txt = (el.inner_text() if sel in ("a", "button") else el.get_attribute("value")) or ""
-                lines.append(f"[{sel}] text={txt.strip()[:60]!r} id={el.get_attribute('id')} "
-                             f"href={(el.get_attribute('href') or '')[:60]}")
-        body = re.sub(r"\s+", " ", page.inner_text("body"))[:1500]
+                txt = (await el.inner_text() if sel in ("a", "button") else await el.get_attribute("value")) or ""
+                lines.append(f"[{sel}] text={txt.strip()[:60]!r} id={await el.get_attribute('id')} "
+                             f"href={(await el.get_attribute('href') or '')[:60]}")
+        body = re.sub(r"\s+", " ", await page.inner_text("body"))[:1500]
         lines.append("\n[body] " + body)
         out = BASE_DIR / S["sid"] / "discover.txt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("\n".join(lines), encoding="utf-8")
-        shot = snap(page, special_folder(S["sid"], "discover"), "discover")
+        shot = await snap(page, special_folder(S["sid"], "discover"), "discover")
         step("🔍 สรุปโครงสร้างหน้าเว็บ (select/ปุ่ม/ลิงก์) แนบเป็นไฟล์", out)
         step("📸 หน้าหลังล็อกอิน", shot)
         print("\n".join(lines[:60]))
     finally:
-        ctx.close()
+        await ctx.close()
 
 
 
@@ -791,60 +800,172 @@ def health_report():
     return level
 
 
-# ---------- ใช้โดยบอท Discord (grade_bot.py): เฝ้า 1 รหัส ควบคุมด้วย Event ----------
-def student_worker(S, stop_event, force_event):
-    """วนเช็ค 1 รหัสไม่หยุด จนกว่า stop_event จะถูกสั่ง (ตั้งค่าใน S ก่อนเรียก)
-    force_event: สั่งให้เช็คทันทีโดยไม่ต้องรอ (ใช้กับคำสั่ง /check)"""
-    sid = S["sid"]
-    discord(f"✅ เริ่มเฝ้าเกรด รหัส {sid} (สั่งผ่าน Discord)\n"
-            f"ทุกรอบเช็คตามลำดับ: ปี1ภาค1 → ... → ปี3ภาค2 → ปพ.1 → Info.")
-    fails, down_since, cycle = 0, None, 0
+# ---------- โมเดลใหม่: MAIN เฝ้าต่อเนื่อง / SUB ตื่นมาตอนแฟนเอาต์ ----------
+VIEWPORT = {"width": 1400, "height": 1000}
+
+
+async def astep(msg, file_path=None, mention=False):
+    """step() แบบไม่บล็อก event loop (discord() มี time.sleep เพื่อจำกัดอัตราส่ง)"""
+    await asyncio.to_thread(step, msg, file_path, mention)
+
+
+async def _on_grades(page):
+    """เกณฑ์เดียวกับ login(): อยู่ในหน้าผลการเรียนจริงไหม"""
     try:
-        while not stop_event.is_set():
-            try:
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    try:
-                        while not stop_event.is_set():
-                            cycle += 1
-                            wait = INTERVAL + random.randint(0, 15)
-                            try:
-                                step(f"▶️ เริ่มรอบที่ {cycle} (รหัส {sid})")
-                                try:
-                                    health_report()
-                                except Exception as he:
-                                    print("ตรวจสถานะเว็บไม่สำเร็จ:", str(he)[:120])
-                                run_cycle(browser, S, force_sweep=False)
-                                if fails >= 1:
-                                    mins = int((time.time() - down_since) / 60)
-                                    step(f"🟢 **{S['name']}**: กลับมาเช็คได้แล้ว (มีปัญหา {fails} ครั้ง ~{mins} นาที)")
-                                fails, down_since = 0, None
-                                step(f"✅ จบรอบที่ {cycle} (รหัส {sid}) | รอบถัดไปใน ~{wait} วินาที")
-                            except Exception as e:
-                                fails += 1
-                                if down_since is None:
-                                    down_since = time.time()
-                                wait = RETRY_FAST + random.randint(0, 5)
-                                step(f"🔴 **{S['name']}** (รหัส {sid}): รอบที่ {cycle} ล้มเหลว (ติดกัน {fails} ครั้ง)\n"
-                                     f"สาเหตุ: {str(e)[:300]}\nลองใหม่ใน ~{wait} วินาที",
-                                     getattr(e, "shot", None))
-                            if force_event.wait(timeout=wait):
-                                force_event.clear()
-                            if stop_event.is_set():
-                                break
-                    finally:
-                        try:
-                            browser.close()
-                        except Exception:
-                            pass
-                break  # ออกจาก with ปกติ (ไม่ใช่เพราะเบราว์เซอร์พัง) แปลว่าตั้งใจหยุด
-            except Exception as e:
-                if stop_event.is_set():
-                    break
-                step(f"♻️ เบราว์เซอร์ของรหัส {sid} มีปัญหา ({str(e)[:150]}) กำลังเปิดใหม่ใน 15 วินาที")
-                stop_event.wait(15)
-    finally:
-        discord(f"⏹️ หยุดเฝ้าเกรดรหัส {sid} แล้ว")
+        flat = re.sub(r"\s+", "", await page.inner_text("body"))
+    except Exception:
+        return False
+    return "ปรับปรุง" in flat or "ปี1ภาค1" in flat
+
+
+class StudentSession:
+    """context + page ของนักเรียน 1 คน
+
+    MAIN : เปิดค้างไว้ตลอดอายุเซสชัน แล้ว park ระหว่างรอบ
+           (เว็บจะไม่ตัด session เพราะ context ยังเปิดอยู่)
+    SUB  : เปิดตอนแฟนเอาต์ -> ล็อกอิน -> เช็ค -> ปิดทิ้ง ไม่ต้องถือไว้
+    """
+
+    def __init__(self, browser, S):
+        self.browser = browser
+        self.S = S
+        self.ctx = None
+        self.page = None
+        self.landed_url = None
+        self.dialogs = []
+        self.downloads = []
+
+    async def open(self):
+        self.ctx = await self.browser.new_context(viewport=VIEWPORT, accept_downloads=True)
+        self.page = await self.ctx.new_page()
+        self.page.set_default_timeout(TIMEOUT_MS)
+        self.dialogs, self.downloads = [], []
+        self.page.on("dialog", lambda d: asyncio.ensure_future(_on_dialog(d, self.dialogs)))
+        self.page.on("download", lambda d: self.downloads.append(d))
+        return self
+
+    async def login(self):
+        """ล็อกอินและจด URL ที่ไปจบ (ใช้ตอนตื่นจากการ park)"""
+        await login(self.page, self.S, self.dialogs)
+        self.landed_url = self.page.url
+        return True
+
+    async def wake(self):
+        """พาหน้ากลับมาที่หน้าผลการเรียน โดยยังใช้ session เดิม"""
+        try:
+            await self.page.goto(self.landed_url or URL, wait_until="domcontentloaded", timeout=30000)
+            await settle(self.page)
+            return await _on_grades(self.page)
+        except Exception:
+            return False
+
+    async def ensure_login(self):
+        """ตื่นจากการ park แล้วยังล็อกอินอยู่ไหม ถ้าไม่อยู่ให้ล็อกอินใหม่"""
+        if await self.wake():
+            return True
+        await self.park()
+        try:
+            return await self.login()
+        except Exception:
+            return False
+
+    async def park(self):
+        """พักหน้าไว้ที่ about:blank คง session ไว้ แต่ปล่อย RAM ของหน้าที่เรนเดอร์"""
+        try:
+            await self.page.goto("about:blank")
+        except Exception:
+            pass
+
+    async def close(self):
+        try:
+            if self.ctx is not None:
+                await self.ctx.close()
+        except Exception:
+            pass
+        self.ctx = self.page = None
+
+
+async def check_student(sess, full=True):
+    """เช็คนักเรียน 1 คน จาก session ที่ล็อกอินอยู่แล้ว
+
+    full=True  -> กวาดทุกภาคตาม watch_terms (+ปพ.1) แบบเดิม
+    full=False -> เช็คแค่ภาคหลัก ใช้ตอนแฟนเอาต์เพื่อความเร็ว
+
+    คืน (changed:bool, info:dict)
+    """
+    S = sess.S
+    terms = list(S.get("watch_terms") or TERMS)
+    if not terms:
+        terms = [TERMS[0]]
+
+    if full:
+        changed = await sweep(sess.page, sess.ctx, S, sess.downloads)
+        return changed, {"mode": "full", "terms": len(terms)}
+
+    y, t = terms[0]
+    try:
+        await go_term(sess.page, y, t)
+    except Exception:
+        return False, {"mode": "fast", "terms": 1, "error": "go_term"}
+    try:
+        changed, grades = await process_term(sess.page, S, y, t, "ปี %s ภาค %s" % (y, t))
+        return changed, {"mode": "fast", "terms": 1, "rows": len(grades or [])}
+    except Exception as e:
+        return False, {"mode": "fast", "terms": 1, "error": str(e)[:80]}
+
+
+async def fan_out(browser, subs, full=False, stagger=1.5, batch=6):
+    """MAIN เจอการเปลี่ยนแปลง -> ไล่เช็ค SUB ทุกคน
+
+    จงใจแบ่งเป็นชุดและหน่วงเวลา ไม่ให้ล็อกอินพร้อมกันหมด
+    เพราะเว็บโรงเรียนมักล่มพอดีตอนที่นักเรียนทั้งโรงเข้าเว็บพร้อมกัน
+
+    ค่าเริ่มต้นคำนวณจากเวลาจริงที่วัดได้ (login ~6s + เช็ค ~3s = ~9s ต่อชุด):
+      27 คน @ batch=6 -> 5 ชุด x 9s + 4 x 1.5s  ~= 51 วินาที  (อยู่ใน 1 นาที)
+      ถ้าขึ้น batch=27 จะจบใน ~9 วินาที แต่ล็อกอินพร้อมกัน 27 คนทันที
+
+    คืน list ของผลลัพธ์แต่ละคน
+    """
+    results = []
+    if not subs:
+        return results
+
+    async def one(sub):
+        sess = StudentSession(browser, sub)
+        try:
+            await sess.open()
+            if not await sess.login():
+                return {"sid": sub["sid"], "changed": False, "error": "login"}
+            changed, info = await check_student(sess, full=full)
+            return {"sid": sub["sid"], "name": sub.get("name") or sub["sid"],
+                    "changed": changed, "info": info}
+        except Exception as e:
+            return {"sid": sub["sid"], "changed": False, "error": str(e)[:120]}
+        finally:
+            await sess.close()
+
+    for i in range(0, len(subs), batch):
+        chunk = subs[i:i + batch]
+        if i:
+            await asyncio.sleep(stagger)
+        results.extend(await asyncio.gather(*(one(s) for s in chunk)))
+    return results
+
+
+def summarize_fanout(results):
+    """สรุปผลแฟนเอาต์เป็นบรรทัดเดียวสำหรับแจ้งเข้า Discord"""
+    total = len(results)
+    changed = [r for r in results if r.get("changed")]
+    failed = [r for r in results if r.get("error")]
+    bits = ["เช็คแล้ว %d คน" % total]
+    if changed:
+        bits.append("**มีการเปลี่ยน %d คน**: %s"
+                    % (len(changed), ", ".join(r.get("name") or r["sid"] for r in changed)))
+    else:
+        bits.append("ไม่มีใครเปลี่ยน")
+    if failed:
+        bits.append("ล้มเหลว %d คน (%s)" % (len(failed), ", ".join(r["sid"] for r in failed[:5])))
+    return " | ".join(bits)
 
 
 def load_or_new_state(sid):
@@ -856,7 +977,7 @@ def load_or_new_state(sid):
 
 
 # ---------- main ----------
-def main():
+async def main():
     debug = "--debug" in sys.argv
 
     if "--test" in sys.argv:
@@ -898,44 +1019,44 @@ def main():
     # วงนอก: เบราว์เซอร์/Playwright พัง → เปิดใหม่แล้วทำต่อ ไม่หยุด
     while True:
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=not debug)
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=not debug)
                 try:
                     if "--discover" in sys.argv:
-                        discover(browser, S)
+                        await discover(browser, S)
                         return
                     while True:
                         cycle += 1
                         wait = INTERVAL + random.randint(0, 15)
                         try:
-                            step(f"▶️ เริ่มรอบที่ {cycle}")
+                            await astep(f"▶️ เริ่มรอบที่ {cycle}")
                             try:
-                                health_report()
+                                await asyncio.to_thread(health_report)
                             except Exception as he:
                                 print("ตรวจสถานะเว็บไม่สำเร็จ:", str(he)[:120])
-                            run_cycle(browser, S, force_sweep=debug)
+                            await run_cycle(browser, S, force_sweep=debug)
                             if fails >= 1:
                                 mins = int((time.time() - down_since) / 60)
-                                step(f"🟢 **{S['name']}** กลับมาเช็คได้แล้ว (มีปัญหา {fails} ครั้ง ~{mins} นาที)")
+                                await astep(f"🟢 **{S['name']}**: กลับมาเช็คได้แล้ว (มีปัญหา {fails} ครั้ง ~{mins} นาที)")
                             fails, down_since = 0, None
-                            step(f"✅ จบรอบที่ {cycle} | รอบถัดไปใน ~{wait} วินาที")
+                            await astep(f"✅ จบรอบที่ {cycle} | รอบถัดไปใน ~{wait} วินาที")
                         except Exception as e:
                             fails += 1
                             if down_since is None:
                                 down_since = time.time()
                             wait = RETRY_FAST + random.randint(0, 5)
-                            step(f"🔴 **{S['name']}**: รอบที่ {cycle} ล้มเหลว (ติดกัน {fails} ครั้ง)\n"
-                                 f"สาเหตุ: {str(e)[:300]}\nลองใหม่ใน ~{wait} วินาที",
-                                 getattr(e, "shot", None))
+                            await astep(f"🔴 **{S['name']}**: รอบที่ {cycle} ล้มเหลว (ติดกัน {fails} ครั้ง)\n"
+                                        f"สาเหตุ: {str(e)[:300]}\nลองใหม่ใน ~{wait} วินาที",
+                                        getattr(e, "shot", None))
                             if any(k in str(e).lower() for k in
-                                   ("target closed", "browser has been closed", "browser has disconnected")):
+                                   ("target closed", "browser has been closed", "browser has been disconnected")):
                                 raise  # เบราว์เซอร์ตาย → ออกไปเปิดใหม่
                         if debug:
                             return
-                        time.sleep(wait)
+                        await asyncio.sleep(wait)
                 finally:
                     try:
-                        browser.close()
+                        await browser.close()
                     except Exception:
                         pass
         except KeyboardInterrupt:
@@ -946,10 +1067,13 @@ def main():
             print(f"ระบบเบราว์เซอร์มีปัญหา: {str(e)[:200]} -> เปิดใหม่ใน 15 วินาที")
             discord(f"♻️ เบราว์เซอร์มีปัญหา ({str(e)[:150]}) กำลังเปิดใหม่ใน 15 วินาที")
             try:
-                time.sleep(15)
+                await asyncio.sleep(15)
             except KeyboardInterrupt:
                 return
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
