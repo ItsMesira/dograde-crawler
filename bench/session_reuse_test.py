@@ -70,7 +70,7 @@ def start_server():
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
 
 
-async def do_login(browser, base, sid="48610", pw="18/04/2554"):
+async def do_login(browser, base, sid="99901", pw="01/01/2550"):
     """ล็อกอินเต็มรูปแบบ คืน context ที่ล็อกอินแล้ว"""
     ctx = await browser.new_context(viewport={"width": 1400, "height": 1000})
     page = await ctx.new_page()

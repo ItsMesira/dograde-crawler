@@ -341,6 +341,188 @@ def is_graded(g):
     return g.rsplit(":", 1)[-1].strip() not in ("0", "", "-")
 
 
+# ---------- อ่านตารางผลการเรียนแบบละเอียด (ใช้ตอนส่งออก Excel) ----------
+_HEADING_RX = re.compile(r"ชั้น\s*มัธยมศึกษาปีที่\s*(\d+)\s*ภาคเรียนที่\s*(\d+)")
+
+
+def _norm_cell(s):
+    return re.sub(r"\s+", " ", (s or "").replace("\u200b", "")).strip()
+
+
+def _uniq_headers(headers):
+    """ทำชื่อคอลัมน์ให้ไม่ซ้ำ/ไม่ว่าง เพื่อใช้เป็น key ของ dict"""
+    out, seen = [], {}
+    for i, h in enumerate(headers):
+        h = _norm_cell(h) or f"คอลัมน์ {i + 1}"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h} #{seen[h]}"
+        else:
+            seen[h] = 1
+        out.append(h)
+    return out
+
+
+def _num_of(rx, text):
+    m = re.search(rx, text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+async def read_student_info(page):
+    """อ่าน เลขประจำตัว/ชื่อ/ห้อง/เลขที่
+
+    หน้านี้แสดงค่าเหล่านี้ในช่อง <input> ค่าจึงไม่โผล่ใน inner_text
+    ถ้าอ่านจากช่องไม่ได้ จะถอยไปใช้ชื่อจาก NAME_RE แทน
+    """
+    info = {"sid": None, "name": None, "room": None, "seat": None}
+
+    # หน้านี้ใช้ id ตายตัว: fid / fName / fRoom / fOrdinal (ช่อง disabled)
+    for key, sel in (("sid", "#fid"), ("name", "#fName"),
+                     ("room", "#fRoom"), ("seat", "#fOrdinal")):
+        try:
+            loc = page.locator(sel)
+            if await loc.count():
+                info[key] = _norm_cell(await loc.first.input_value())
+        except Exception:
+            pass
+    if all(info.values()):
+        return info
+
+    vals = []
+    try:
+        inputs = page.locator(
+            'input:visible:not([type="submit"]):not([type="button"]):not([type="hidden"])')
+        for i in range(await inputs.count()):
+            inp = inputs.nth(i)
+            try:
+                val = _norm_cell(await inp.input_value())
+            except Exception:
+                continue
+            if not val:
+                continue
+            vals.append(val)
+            label = ""
+            for xp in ("xpath=ancestor::td[1]/preceding-sibling::td[1]",
+                       "xpath=ancestor::tr[1]",
+                       "xpath=ancestor::td[1]"):
+                try:
+                    loc = inp.locator(xp)
+                    if await loc.count() == 0:   # count() ไม่รอ timeout
+                        continue
+                    label = _norm_cell(await loc.first.inner_text(timeout=1000))
+                except Exception:
+                    label = ""
+                if label and len(label) <= 40:
+                    break
+            if "เลขประจำตัว" in label:
+                info["sid"] = info["sid"] or val
+            elif "เลขที่" in label:
+                info["seat"] = info["seat"] or val
+            elif "ห้อง" in label:
+                info["room"] = info["room"] or val
+            elif "ชื่อ" in label:
+                info["name"] = info["name"] or val
+    except Exception:
+        pass
+
+    # ถ้ายังไม่ครบและมี 4 ช่องพอดี: เลขประจำตัว -> ชื่อ -> ห้อง -> เลขที่
+    if len(vals) == 4:
+        for key, val in zip(("sid", "name", "room", "seat"), vals):
+            info[key] = info[key] or val
+
+    if not info["name"] or not info["sid"]:
+        try:
+            flat = re.sub(r"\s+", " ", await page.inner_text("body"))
+            if not info["name"]:
+                nm = NAME_RE.search(flat)
+                if nm:
+                    info["name"] = re.sub(r"\s+", " ", nm.group(1)).strip()
+            if not info["sid"]:
+                m = re.search(r"เลขประจำตัว\D{0,5}(\d{4,})", flat)
+                if m:
+                    info["sid"] = m.group(1)
+        except Exception:
+            pass
+    return info
+
+
+async def read_term_table(page):
+    """อ่านทั้งหน้าผลการเรียนเป็นข้อมูลโครงสร้าง (สำหรับส่งออก Excel)
+
+    คืน dict: level, term, updated, gpa, credits, student, headers, subjects
+    ไม่แตะ state.json และไม่เรียก image_check จึงไม่กระทบการแจ้งเตือนของบอท
+    """
+    body = await page.inner_text("body")
+    if "Server Error" in body or "Runtime Error" in body:
+        raise Exception("เว็บล่ม: ขึ้นหน้า Server Error ระหว่างอ่านตาราง")
+    flat = re.sub(r"\s+", " ", body)
+
+    m = _HEADING_RX.search(flat)
+    level = int(m.group(1)) if m else None
+    term = int(m.group(2)) if m else None
+    mu = re.search(r"ปรับปรุง[^\d]*(\d{1,2}:\d{2}\s+\d{1,2}/\d{1,2}/\d{4})", body)
+    updated = re.sub(r"\s+", " ", mu.group(1)).strip() if mu else None
+
+    gpa = _num_of(r"ผลการเรียนเฉลี่ย\s*GPA\s*([0-9]+(?:\.[0-9]+)?)", flat)
+    credits = {
+        "basic": _num_of(r"พื้นฐานที่\S*\s*([0-9]+(?:\.[0-9]+)?)", flat),
+        "extra": _num_of(r"เพิ่มเติมที่\S*\s*([0-9]+(?:\.[0-9]+)?)", flat),
+        "total": _num_of(r"รวมจำนวนหน่วยกิตที่\S*\s*([0-9]+(?:\.[0-9]+)?)", flat),
+    }
+
+    headers, subjects = [], []
+    for table in await page.locator("table").all():
+        try:
+            rows = await table.locator("tr").all()
+        except Exception:
+            continue
+        hi, hdr = None, []
+        for ri, row in enumerate(rows):
+            try:
+                cells = [_norm_cell(c) for c in await row.locator("th, td").all_inner_texts()]
+            except Exception:
+                continue
+            if any(GRADE_COLUMN in c for c in cells):
+                hi, hdr = ri, _uniq_headers(cells)
+                break
+        if hi is None:
+            continue
+        for row in rows[hi + 1:]:
+            try:
+                cells = [_norm_cell(c) for c in await row.locator("td").all_inner_texts()]
+            except Exception:
+                continue
+            if not cells:
+                continue
+            if any(GRADE_COLUMN in c for c in cells):
+                break  # เจอหัวตารางซ้ำ = จบตารางนี้
+            if len(cells) < len(hdr):
+                continue
+            rec = dict(zip(hdr, cells[:len(hdr)]))
+            if not rec.get("รหัสวิชา") and not rec.get("รายวิชา"):
+                continue
+            subjects.append(rec)
+        if subjects:
+            headers = hdr
+            break  # ใช้ตารางแรกที่มีข้อมูลเกรด
+
+    if not subjects:
+        # ภาคที่ยังไม่มีข้อมูล: อย่าใส่ GPA/หน่วยกิต 0.00 ให้เข้าใจผิด
+        gpa = None
+        credits = {"basic": None, "extra": None, "total": None}
+
+    return {"level": level, "term": term, "updated": updated,
+            "gpa": gpa, "credits": credits,
+            "student": await read_student_info(page),
+            "headers": headers, "subjects": subjects}
+
+
+
 # ---------- ล็อกอิน ----------
 async def _on_dialog(d, dialogs):
     """Playwright async: dialog.accept() เป็น coroutine ต้อง await จึงต้องเป็น handler แบบ async"""
@@ -591,7 +773,7 @@ async def sweep(page, ctx, S, downloads):
                      + (await dump_clickables(page))[:1500])
             continue
         step(f"🔀 เลือก **{tag}** แล้ว ({method})")
-        changed, grades = process_term(page, S, y, t, tag)
+        changed, grades = await process_term(page, S, y, t, tag)
         if idx == 0 and not grades:
             raise Exception(f"{tag} อ่านข้อมูลไม่ได้ (ยังไม่ไปต่อภาคอื่น) จะเริ่มรอบใหม่ตั้งแต่ {tag}")
         any_change = any_change or changed
@@ -992,10 +1174,10 @@ async def main():
         if sid:
             break
     while True:
-        pw = input("วันเกิด (วว/ดด/ปปปป พ.ศ. เช่น 18/04/2554): ").strip()
+        pw = input("วันเกิด (วว/ดด/ปปปป พ.ศ. เช่น 01/01/2550): ").strip()
         if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", pw):
             break
-        print("รูปแบบไม่ถูก ต้องเป็นแบบ 18/04/2554")
+        print("รูปแบบไม่ถูก ต้องเป็นแบบ 01/01/2550")
 
     (BASE_DIR / sid).mkdir(parents=True, exist_ok=True)
     try:
