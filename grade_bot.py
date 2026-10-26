@@ -7,6 +7,8 @@
         /watch   เปิดฟอร์มกรอกรหัสนักเรียน + วันเกิด (ไม่โชว์ในแชท) แล้วเริ่มเฝ้า
         /stop    หยุดเฝ้ารหัสที่ระบุ
         /check   สั่งเช็คทันที ไม่ต้องรอรอบถัดไป
+        /autoexport  เฝ้าบัญชีเดียว แล้ว export ทั้งห้องเมื่อเกรดเปลี่ยน
+        /autoexport_stop  หยุด auto-export
         /status  ดูว่ากำลังเฝ้ารหัสไหนอยู่บ้าง
         /help_grade  สรุปคำสั่งทั้งหมด
 
@@ -27,6 +29,8 @@ from discord import app_commands
 from discord.ext import commands
 
 import grade_watch_v3 as g   # ใช้เอนจิ้นเดิมทั้งหมด (login, sweep, step, alert, ฯลฯ)
+import auto_export
+import export_grades as exporter
 
 # ---------------- ตั้งค่า ----------------
 CONFIG_PATH = Path(__file__).with_name("bot_config.json")
@@ -51,6 +55,8 @@ g.BASE_DIR = Path(__file__).resolve().parent / "shots"
 
 # sid -> {"S": state dict, "stop": asyncio.Event, "force": asyncio.Event, "task": Task}
 workers: dict[str, dict] = {}
+# auto-export ใช้บัญชีเดียว: {"sid": str, "term": (y,t), "stop": asyncio.Event, "task": Task}
+AUTO: dict = {"sid": None, "term": None, "stop": None, "task": None}
 _browser = None
 _pw = None
 _announced = False
@@ -164,6 +170,8 @@ async def start_worker(sid: str, pw: str, watch_terms: list, watch_pp1: bool) ->
     w = workers.get(sid)
     if w and w.get("task") and not w["task"].done():
         return f"กำลังเฝ้ารหัส {sid} อยู่แล้ว"
+    if AUTO.get("sid") == sid and AUTO.get("task") and not AUTO["task"].done():
+        return f"รหัส {sid} กำลังถูกใช้ใน /autoexport อยู่ — ใช้ /autoexport_stop ก่อน"
 
     S = {"sid": sid, "pw": pw, "name": sid, "state": g.load_or_new_state(sid),
          "watch_terms": watch_terms, "watch_pp1": watch_pp1}
@@ -245,6 +253,11 @@ class GradeBot(commands.Bot):
         print("เปิดเบราว์เซอร์สำหรับเฝ้าเกรดแล้ว")
 
     async def close(self):
+        if AUTO.get("stop"):
+            AUTO["stop"].set()
+        auto_task = AUTO.get("task")
+        if auto_task and not auto_task.done():
+            await asyncio.gather(auto_task, return_exceptions=True)
         for w in list(workers.values()):
             if w.get("stop"):
                 w["stop"].set()
@@ -282,6 +295,116 @@ async def watch_cmd(inter: discord.Interaction):
         view=TermSelectView(), ephemeral=True)
 
 
+@tree.command(name="autoexport",
+              description="เฝ้าเกรดบัญชีเดียว แล้ว export ทั้งห้องเมื่อเกรดเปลี่ยน")
+@app_commands.describe(
+    term="ภาคที่จะเฝ้า",
+    sid="รหัสนักเรียนที่จะใช้เฝ้า (เว้นว่าง = คนแรกใน students.csv)",
+    keep="เฝ้าต่อหลัง export (ปกติหยุดหลัง export ครั้งแรก)",
+)
+@app_commands.choices(term=[
+    app_commands.Choice(name=f"ปี{y} ภาค{t}", value=i)
+    for i, (y, t) in enumerate(auto_export.TERM_BUTTONS, 1)
+])
+async def autoexport_cmd(inter: discord.Interaction,
+                         term: app_commands.Choice[int],
+                         sid: str = "", keep: bool = False):
+    if not allowed(inter):
+        return await deny(inter)
+
+    if AUTO.get("task") and not AUTO["task"].done():
+        await inter.response.send_message(
+            "มี auto-export ทำงานอยู่แล้ว — ใช้ /autoexport_stop ก่อน", ephemeral=True)
+        return
+
+    try:
+        roster, errors = exporter.load_roster(exporter.DEFAULT_ROSTER)
+    except SystemExit as ex:
+        await inter.response.send_message(str(ex), ephemeral=True)
+        return
+    except Exception as ex:
+        await inter.response.send_message(
+            f"อ่านรายชื่อไม่สำเร็จ: {str(ex)[:300]}", ephemeral=True)
+        return
+    if not roster:
+        await inter.response.send_message(
+            "ไม่มีรายชื่อที่ใช้ได้ — ต้องมี students.csv ที่ repo root", ephemeral=True)
+        return
+
+    sid = str(sid or "").strip()
+    rec = None
+    if sid:
+        rec = next((r for r in roster if str(r["sid"]) == sid), None)
+        if rec is None:
+            await inter.response.send_message(
+                f"ไม่พบรหัส {sid} ใน students.csv", ephemeral=True)
+            return
+    else:
+        rec = roster[0]
+
+    if workers.get(rec["sid"]) and workers[rec["sid"]].get("task") \
+            and not workers[rec["sid"]]["task"].done():
+        await inter.response.send_message(
+            f"รหัส {rec['sid']} กำลังถูกใช้ใน /watch อยู่ — หยุดก่อนด้วย /stop",
+            ephemeral=True)
+        return
+
+    y, t = auto_export.TERM_BUTTONS[term.value - 1]
+    stop = asyncio.Event()
+
+    async def on_change(info):
+        diff = f"{info['diff']}%" if info["diff"] is not None else "?"
+        _queue_step(f"🎉 **พบการเปลี่ยนแปลง!** ปี{y} ภาค{t} (ต่าง {diff}) — "
+                    f"กำลัง export ทั้ง {len(roster)} คน")
+        out = auto_export.default_out(y, t)
+        rc, output = await auto_export.export_roster_async(
+            term.value, out, workers=3, stagger=2)
+        if rc != 0:
+            _queue_step(f"❌ export อัตโนมัติไม่สำเร็จ (rc={rc})\n"
+                        f"```{(output or 'ไม่มี output')[-1200:]}```")
+            return None
+        _queue_step(f"📊 export เสร็จ: **{out.name}**", str(out))
+        return out
+
+    async def runner():
+        try:
+            ok = await auto_export.watch_trigger(
+                _browser, rec, (y, t), stop=stop, on_change=on_change,
+                notify=_queue_step, interval=g.INTERVAL, once=not keep)
+            if not ok and not stop.is_set():
+                _queue_step(f"⚠️ auto-export ของ **{rec['sid']}** จบโดยไม่ได้ไฟล์")
+        except Exception as ex:
+            _queue_step(f"❌ auto-export ผิดพลาด: {str(ex)[:300]}")
+        finally:
+            if AUTO.get("task") is asyncio.current_task():
+                AUTO.update(sid=None, term=None, stop=None, task=None)
+            _queue_step(f"🛑 หยุด auto-export **{rec['sid']}** แล้ว")
+
+    AUTO.update({"sid": rec["sid"], "term": (y, t), "stop": stop, "task": None})
+    AUTO["task"] = asyncio.create_task(runner(), name=f"autoexport-{rec['sid']}")
+
+    await inter.response.send_message(
+        "เริ่ม auto-export ✅\n"
+        f"บัญชีกระตุ้น: **{rec['sid']}** ({rec.get('name') or 'ไม่มีชื่อ'})\n"
+        f"เฝ้า: ปี{y} ภาค{t} ทุก {g.INTERVAL} วินาที\n"
+        f"โหมด: {'เฝ้าต่อหลัง export' if keep else 'หยุดหลัง export ครั้งแรก'}\n"
+        "เมื่อพบการเปลี่ยน จะ export ทั้งห้องและแนบ .xlsx ในช่อง Webhook",
+        ephemeral=True)
+
+
+@tree.command(name="autoexport_stop", description="หยุด auto-export ที่กำลังเฝ้าอยู่")
+async def autoexport_stop_cmd(inter: discord.Interaction):
+    if not allowed(inter):
+        return await deny(inter)
+    task = AUTO.get("task")
+    if not task or task.done():
+        await inter.response.send_message("ยังไม่มี auto-export ที่ทำงานอยู่", ephemeral=True)
+        return
+    AUTO["stop"].set()
+    await inter.response.send_message(
+        "สั่งหยุด auto-export แล้ว (จะหยุดหลังจบงานปัจจุบัน)", ephemeral=True)
+
+
 @tree.command(name="stop", description="หยุดเฝ้าเกรดของรหัสที่ระบุ")
 @app_commands.describe(sid="รหัสนักเรียนที่จะหยุดเฝ้า")
 async def stop_cmd(inter: discord.Interaction, sid: str):
@@ -315,11 +438,16 @@ async def check_cmd(inter: discord.Interaction, sid: str):
 async def status_cmd(inter: discord.Interaction):
     if not allowed(inter):
         return await deny(inter)
-    if not workers:
+    auto_task = AUTO.get("task")
+    auto_alive = bool(auto_task and not auto_task.done())
+    if not workers and not auto_alive:
         await inter.response.send_message("ยังไม่ได้เฝ้ารหัสไหนอยู่ ใช้ /watch เพื่อเริ่ม",
                                           ephemeral=True)
         return
     lines = []
+    if auto_alive:
+        y, t = AUTO.get("term") or (1, 1)
+        lines.append(f"**auto-export**: {AUTO.get('sid')} | ปี{y} ภาค{t} | 🟢 กำลังทำงาน")
     for sid, w in workers.items():
         task = w.get("task")
         alive = "🟢 กำลังทำงาน" if task and not task.done() else "🔴 หยุดแล้ว"
@@ -338,8 +466,10 @@ async def help_cmd(inter: discord.Interaction):
         "`/watch` — เปิดฟอร์มกรอกรหัสนักเรียน/วันเกิด แล้วเริ่มเฝ้า\n"
         "`/stop <รหัส>` — หยุดเฝ้ารหัสนั้น\n"
         "`/check <รหัส>` — สั่งเช็คทันที\n"
+        "`/autoexport <ภาค>` — เฝ้าบัญชีเดียว แล้ว export ทั้งห้องเมื่อเกรดเปลี่ยน\n"
+        "`/autoexport_stop` — หยุด auto-export\n"
         "`/status` — ดูสถานะทั้งหมด\n"
-        "ผลลัพธ์ทุกอย่าง (เช็ครอบไหน เกรดเปลี่ยนไหม รูปแคป) "
+        "ผลลัพธ์ทุกอย่าง (เช็ครอบไหน เกรดเปลี่ยนไหม รูปแคป/ไฟล์ Excel) "
         "จะแจ้งในช่อง Discord ที่ตั้ง Webhook ไว้ตามปกติ",
         ephemeral=True)
 
@@ -363,10 +493,10 @@ async def on_ready():
               f"(ขอบเขต: {'guild ' + GUILD_ID if GUILD_ID else 'global ใช้เวลาเข้าถึงได้นานสุด 1 ชม.'})")
     except Exception as e:
         print("sync คำสั่งไม่สำเร็จ:", e)
-    print(f"บอทพร้อมใช้งาน: {bot.user} (ใช้คำสั่ง /watch ใน Discord ได้เลย)")
+    print(f"บอทพร้อมใช้งาน: {bot.user} (ใช้คำสั่ง /watch หรือ /autoexport ใน Discord ได้เลย)")
     if not _announced:
         _announced = True
-        _queue_step("🤖 บอทเฝ้าเกรดออนไลน์แล้ว พิมพ์ `/watch` ใน Discord เพื่อเริ่ม")
+        _queue_step("🤖 บอทเฝ้าเกรดออนไลน์แล้ว พิมพ์ `/watch` หรือ `/autoexport` ใน Discord เพื่อเริ่ม")
 
 
 if __name__ == "__main__":

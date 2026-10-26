@@ -2,7 +2,7 @@
 
 อ่านรายชื่อจาก CSV/XLSX แล้วล็อกอินทีละคนด้วยเอนจินเดิมของ grade_watch_v3
 ไม่แตะ state.json / baseline.png จึงไม่กระทบการแจ้งเตือนของบอท
-และไม่ยิง Discord เลย (ตั้ง g.WEBHOOK = "")
+และไม่ยิง Discord เลย (ตอนรัน CLI ตั้ง g.WEBHOOK = "")
 
 ติดตั้งเพิ่มครั้งเดียว:
     pip install openpyxl
@@ -36,7 +36,6 @@ except Exception:
 
 import grade_watch_v3 as g
 
-g.WEBHOOK = ""                  # ห้ามยิง Discord ตอนส่งออก
 g.BASE_DIR = ROOT / "shots"     # ให้อยู่ที่ repo root เสมอ ไม่ขึ้นกับ CWD
 
 DEFAULT_ROSTER = ROOT / "students.csv"
@@ -565,6 +564,7 @@ def main(argv=None):
     ap.add_argument("--verbose", action="store_true", help="แสดงทุกขั้นตอนของเอนจิน")
     args = ap.parse_args(argv)
 
+    g.WEBHOOK = ""              # export CLI ต้องไม่ยิง Discord/ไม่ค้างรอ webhook
     if args.term is not None and args.terms:
         raise SystemExit("เลือกอย่างใดอย่างหนึ่ง: --term หรือ --terms")
     if args.term is not None:
