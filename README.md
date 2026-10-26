@@ -397,6 +397,7 @@ dograde-crawler/
 ---
 
 ## เครดิต
-ขอขอบคุณ : <https://github.com/IamKUN67/prakan-dograde-watcher>
+*ขอขอบคุณ : <https://github.com/IamKUN67/prakan-dograde-watcher>*
+
 โปรเจกต์ส่วนตัวสำหรับใช้งานในห้องเรียน
 ซอร์สโค้ดเผยแพร่ที่ <https://github.com/ItsMesira/dograde-crawler>
